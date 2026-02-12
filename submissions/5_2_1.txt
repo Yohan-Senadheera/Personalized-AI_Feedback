@@ -1,0 +1,9 @@
+STUDENT ID: 5
+COURSE ID: 2
+ASSIGNMENT ID: 1
+SUBMISSION ID: 3
+
+=== PDF SUBMISSION TEXT ===
+1. A Service gives fixed IPs to pods so pods never change address.
+2. ClusterIP is used to access from internet. NodePort is inside only.
+3. NetworkPolicy is used to speed up the network by routing faster.

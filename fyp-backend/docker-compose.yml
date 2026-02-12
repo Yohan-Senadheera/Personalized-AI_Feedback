@@ -1,0 +1,31 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: fyp_db
+    environment:
+      POSTGRES_USER: fyp
+      POSTGRES_PASSWORD: fyp123
+      POSTGRES_DB: fyp_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - fyp_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fyp -d fyp_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: fyp_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  fyp_db_data:

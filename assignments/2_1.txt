@@ -1,0 +1,13 @@
+COURSE ID: 2
+ASSIGNMENT ID: 1
+ASSIGNMENT NAME: Test_Assignment_1 – Short Answer (Networking)
+
+=== DESCRIPTION / INSTRUCTIONS (FROM INTRO) ===
+Explain what a Kubernetes Service is and why we use it. (3–5 sentences)
+
+What’s the difference between ClusterIP and NodePort? (2–3 sentences)
+
+Give one example scenario where a NetworkPolicy is useful. (2–3 sentences)
+
+=== ASSIGNMENT ADDITIONAL FILES ===
+(None found)

@@ -1,0 +1,14 @@
+STUDENT ID: 4
+COURSE ID: 2
+ASSIGNMENT ID: 1
+SUBMISSION ID: 2
+
+=== PDF SUBMISSION TEXT ===
+1. A Kubernetes Service is a stable endpoint that exposes a set of Pods. Since Pods
+can restart and change IPs, the Service gives a consistent way to reach them using a
+virtual IP and DNS name. It also load-balances tra(cid:431)ic across matching Pods.
+2. ClusterIP is only reachable inside the cluster, mainly for internal communication.
+NodePort exposes the service on a port of every node so it can be accessed from
+outside.
+3. NetworkPolicy is useful when you want only the backend pods to accept tra(cid:431)ic from
+the frontend pods, and block all other pods in the namespace.

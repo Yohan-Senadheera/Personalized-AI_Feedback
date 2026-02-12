@@ -432,3 +432,32 @@ def student_progress(student_id: int, limit: int = 20):
 
     finally:
         db.close()
+        
+        
+@app.get("/moodle/push_payload/{submission_id}")
+def moodle_push_payload(submission_id: int):
+    db = SessionLocal()
+    try:
+        sub = db.query(Submission).filter(Submission.id == submission_id).first()
+        if not sub:
+            raise HTTPException(status_code=404, detail="Submission not found")
+
+        fb = (
+            db.query(FeedbackResult)
+              .filter(FeedbackResult.submission_id == submission_id)
+              .order_by(FeedbackResult.id.desc())
+              .first()
+        )
+        if not fb:
+            raise HTTPException(status_code=404, detail="No feedback found for submission")
+
+        return {
+            "moodle_user_id": int(sub.student_id),
+            "moodle_submission_id": int(sub.moodle_submission_id) if sub.moodle_submission_id else None,
+            "moodle_assign_id": int(sub.assignment_id),
+            "grade": float(fb.grade) if fb.grade else None,
+            "feedback_text": fb.feedback_text or ""
+        }
+    finally:
+        db.close()
+

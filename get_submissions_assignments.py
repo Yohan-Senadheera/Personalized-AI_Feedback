@@ -1,31 +1,50 @@
 import os
+import time
 import re
 import html
 import requests
+from datetime import datetime
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
 import pdfplumber
 
-# ✅ YOUR SETTINGS
-MOODLE_URL = "http://localhost:8080/moodle"
-TOKEN = "ef6d0d7a10b807c02a779fded5d568bf"
-COURSE_ID = 2
+# =========================
+# CONFIG (edit or use env)
+# =========================
+MOODLE_URL = os.getenv("MOODLE_URL", "http://localhost:8080/moodle")
+MOODLE_TOKEN = os.getenv("MOODLE_TOKEN", "ef6d0d7a10b807c02a779fded5d568bf")
 
-# Put 0 first -> script will print assignments + tell you what to set
-ASSIGNMENT_ID = 1
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
-ASSIGNMENTS_DIR = "assignments"
-SUBMISSIONS_DIR = "submissions"
+COURSE_ID = int(os.getenv("COURSE_ID", "2"))
+ASSIGNMENT_ID = int(os.getenv("ASSIGNMENT_ID", "1"))
+
+PLAG_THRESHOLD = float(os.getenv("PLAG_THRESHOLD", "0.85"))
+
+# Save downloaded PDFs here
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "submissions_downloads"))
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+# Token cap for extracted text (avoid massive payloads)
+MAX_EXTRACT_CHARS = int(os.getenv("MAX_EXTRACT_CHARS", "30000"))
 
 
-def call_moodle(function_name: str, params: dict) -> dict:
+# =========================
+# Moodle helpers
+# =========================
+def moodle_call(wsfunction: str, **params):
+    """
+    Moodle REST API call.
+    Important: to pass array params use: **{"courseids[0]": 2}
+    """
     endpoint = f"{MOODLE_URL}/webservice/rest/server.php"
     base_params = {
-        "wstoken": TOKEN,
-        "wsfunction": function_name,
+        "wstoken": MOODLE_TOKEN,
+        "wsfunction": wsfunction,
         "moodlewsrestformat": "json",
     }
     merged = {**base_params, **params}
-
     r = requests.post(endpoint, data=merged, timeout=60)
     r.raise_for_status()
     data = r.json()
@@ -39,7 +58,7 @@ def call_moodle(function_name: str, params: dict) -> dict:
 def add_token_to_fileurl(fileurl: str) -> str:
     parts = urlparse(fileurl)
     q = dict(parse_qsl(parts.query))
-    q["token"] = TOKEN
+    q["token"] = MOODLE_TOKEN
     return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, urlencode(q), parts.fragment))
 
 
@@ -48,7 +67,6 @@ def safe_name(s: str) -> str:
 
 
 def strip_html_to_text(html_string: str) -> str:
-    """Lightweight HTML -> text (no external libs)."""
     if not html_string:
         return ""
     s = html.unescape(html_string)
@@ -59,11 +77,8 @@ def strip_html_to_text(html_string: str) -> str:
     return s
 
 
-def download_file(url: str, out_path: str) -> None:
-    dir_name = os.path.dirname(out_path)
-    if dir_name:
-        os.makedirs(dir_name, exist_ok=True)
-
+def download_file(url: str, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(out_path, "wb") as fp:
@@ -72,227 +87,199 @@ def download_file(url: str, out_path: str) -> None:
                     fp.write(chunk)
 
 
-def preview_pdf_text(pdf_path: str, max_chars: int = 30000) -> str:
+def extract_text_from_pdf(pdf_path: Path, max_chars: int = 30000) -> str:
     parts = []
-    with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            if t.strip():
-                parts.append(t)
-    text = "\n\n".join(parts).strip()
+    try:
+        with pdfplumber.open(str(pdf_path)) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text() or ""
+                if t.strip():
+                    parts.append(t)
+        text = "\n\n".join(parts).strip()
 
-    if not text:
-        return "(No extractable text - may be scanned/image PDF)"
+        if not text:
+            return ""
 
-    if len(text) > max_chars:
-        text = text[:max_chars] + "..."
-    return text
+        if len(text) > max_chars:
+            text = text[:max_chars] + "..."
+        return text
 
-
-def extract_submission_files_and_text(submissions_json: dict):
-    files = []
-    texts = []
-
-    for assignment in submissions_json.get("assignments", []):
-        for sub in assignment.get("submissions", []):
-            userid = sub.get("userid")
-            submissionid = sub.get("id")
-
-            for plugin in sub.get("plugins", []):
-                # 1) FILES
-                for area in plugin.get("fileareas", []):
-                    for f in area.get("files", []):
-                        files.append({
-                            "userid": userid,
-                            "submissionid": submissionid,
-                            "filename": f.get("filename"),
-                            "fileurl": f.get("fileurl"),
-                            "mimetype": f.get("mimetype"),
-                        })
-
-                # 2) ONLINE TEXT
-                for ef in plugin.get("editorfields", []):
-                    name = ef.get("name") or "editorfield"
-                    html_text = ef.get("text") or ef.get("content") or ""
-                    if html_text and html_text.strip():
-                        texts.append({
-                            "userid": userid,
-                            "submissionid": submissionid,
-                            "fieldname": name,
-                            "html": html_text,
-                            "plain": strip_html_to_text(html_text),
-                        })
-
-    return files, texts
+    except Exception as e:
+        print("❌ pdfplumber extract error:", e)
+        return ""
 
 
-def save_assignment_master(assignments_dir: str, course_id: int, assignment_id: int, content: str) -> str:
-    os.makedirs(assignments_dir, exist_ok=True)
-    path = os.path.join(assignments_dir, f"{course_id}_{assignment_id}.txt")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"✅ Saved assignment: {path}")
-    return path
+# =========================
+# Backend helpers
+# =========================
+def backend_post(path: str, payload: dict | None = None):
+    payload = payload or {}
+    r = requests.post(f"{BACKEND_URL}{path}", json=payload, timeout=180)
+    r.raise_for_status()
+    return r.json()
 
 
-def save_student_submission_text(submissions_dir: str, student_id: int, course_id: int, assignment_id: int, content: str):
-    os.makedirs(submissions_dir, exist_ok=True)
-    filename = f"{student_id}_{course_id}_{assignment_id}.txt"
-    path = os.path.join(submissions_dir, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    print(f"✅ Saved submission: {path}")
+# =========================
+# Moodle grade push
+# =========================
+def push_grade_to_moodle(assign_id: int, user_id: int, grade: float, feedback: str):
+    """
+    Push grade + feedback to Moodle.
+    NOTE: feedbackformat may differ depending on Moodle config.
+    1 = HTML is usually fine.
+    """
+    return moodle_call(
+        "mod_assign_save_grade",
+        **{
+            "assignmentid": assign_id,
+            "userid": user_id,
+            "grade": str(grade),
+            "attemptnumber": -1,
+            "addattempt": 0,
+            "workflowstate": "graded",
+            "feedbacktext": feedback,
+            "feedbackformat": 1,
+        }
+    )
 
 
-def get_course_assignments(course_id: int) -> list[dict]:
-    data = call_moodle("mod_assign_get_assignments", {"courseids[0]": course_id})
-    for course in data.get("courses", []):
-        if course.get("id") == course_id:
-            return course.get("assignments", [])
-    return []
+# =========================
+# Fetch due date + submissions
+# =========================
+def get_assignment_due_date(course_id: int, assignment_id: int) -> int:
+    data = moodle_call("mod_assign_get_assignments", **{"courseids[0]": course_id})
+    for c in data.get("courses", []):
+        for a in c.get("assignments", []):
+            if a.get("id") == assignment_id:
+                return int(a.get("duedate") or 0)
+    return 0
 
 
-def extract_assignment_files(assignment_obj: dict) -> list[dict]:
-    files = []
-    for key in ("introfiles", "introattachments"):
-        for f in assignment_obj.get(key, []) or []:
-            files.append({
-                "filename": f.get("filename"),
-                "fileurl": f.get("fileurl"),
-                "mimetype": f.get("mimetype", ""),
-                "source": key
-            })
-    return files
-
-
-def main():
-    # 1) List assignments in the course
-    assignments = get_course_assignments(COURSE_ID)
-
+def get_submissions(assignment_id: int) -> list[dict]:
+    data = moodle_call("mod_assign_get_submissions", **{"assignmentids[0]": assignment_id})
+    assignments = data.get("assignments", [])
     if not assignments:
-        print("❌ No assignments found in this course yet.")
-        print("👉 Create an Assignment in course id=2, then run again.")
-        return
+        return []
+    return assignments[0].get("submissions", []) or []
 
-    print("\n📌 Assignments found in course:")
-    for a in assignments:
-        print(f"  - ASSIGNMENT_ID: {a.get('id')} | NAME: {a.get('name')}")
 
-    if ASSIGNMENT_ID == 0:
-        print("\n✅ Now pick one ASSIGNMENT_ID from above and set ASSIGNMENT_ID in the code.")
-        return
+# =========================
+# Extract submission text (online or PDF)
+# =========================
+def get_submission_text(sub: dict) -> str:
+    plugins = sub.get("plugins", [])
 
-    # 2) Find the selected assignment object
-    assignment = None
-    for a in assignments:
-        if a.get("id") == ASSIGNMENT_ID:
-            assignment = a
-            break
+    # 1) Try online text first
+    for p in plugins:
+        if p.get("type") == "onlinetext":
+            for ef in p.get("editorfields", []):
+                html_text = ef.get("text") or ef.get("content") or ""
+                plain = strip_html_to_text(html_text)
+                if plain.strip():
+                    return plain
 
-    if assignment is None:
-        raise RuntimeError(f"❌ ASSIGNMENT_ID={ASSIGNMENT_ID} not found in course {COURSE_ID}.")
+    # 2) Try files (PDF)
+    for p in plugins:
+        if p.get("type") == "file":
+            for area in p.get("fileareas", []):
+                for f in area.get("files", []):
+                    filename = f.get("filename") or ""
+                    fileurl = f.get("fileurl") or ""
+                    mimetype = (f.get("mimetype") or "").lower()
 
-    # 3) Build master assignment text
-    assign_name = assignment.get("name", "")
-    intro_html = assignment.get("intro", "")
-    intro_text = strip_html_to_text(intro_html)
+                    is_pdf = ("pdf" in mimetype) or filename.lower().endswith(".pdf")
+                    if not is_pdf or not fileurl:
+                        continue
 
-    master_sections = []
-    master_sections.append(f"COURSE ID: {COURSE_ID}")
-    master_sections.append(f"ASSIGNMENT ID: {ASSIGNMENT_ID}")
-    master_sections.append(f"ASSIGNMENT NAME: {assign_name}\n")
-    master_sections.append("=== DESCRIPTION / INSTRUCTIONS (FROM INTRO) ===")
-    master_sections.append(intro_text if intro_text else "(No intro text found)")
+                    token_url = add_token_to_fileurl(fileurl)
 
-    # 4) Download + extract text from assignment PDF attachments (if any)
-    assignment_files = extract_assignment_files(assignment)
-    if assignment_files:
-        master_sections.append("\n=== ASSIGNMENT ADDITIONAL FILES (EXTRACTED TEXT) ===")
-        for af in assignment_files:
-            fname = af["filename"] or "file"
-            furl = af["fileurl"]
-            mm = (af["mimetype"] or "").lower()
-            master_sections.append(f"\n--- File: {fname} (from {af['source']}) ---")
+                    out = DOWNLOAD_DIR / f"{sub.get('id')}_{sub.get('userid')}_{safe_name(filename)}"
+                    print(f"⬇️ Downloading PDF: {filename}")
+                    download_file(token_url, out)
 
-            if not furl:
-                master_sections.append("(No fileurl)")
-                continue
+                    # sanity check: must start with %PDF
+                    head = out.read_bytes()[:4]
+                    if head != b"%PDF":
+                        print("❌ Not a PDF. First bytes:", head)
+                        # Print first 200 chars for debugging (often JSON error)
+                        try:
+                            txt = out.read_text(errors="ignore")[:200]
+                            print("Response preview:", txt)
+                        except Exception:
+                            pass
+                        return ""
 
-            is_pdf = ("pdf" in mm) or fname.lower().endswith(".pdf")
-            if not is_pdf:
-                master_sections.append("(Skipped: not a PDF)")
-                continue
+                    text = extract_text_from_pdf(out, max_chars=MAX_EXTRACT_CHARS)
+                    if text.strip():
+                        return text
 
-            tmp = f"tmp_assignment_{safe_name(fname)}"
-            token_url = add_token_to_fileurl(furl)
-            download_file(token_url, tmp)
+                    print("⚠️ PDF has no extractable text (maybe scanned/image PDF).")
+                    return ""
 
-            try:
-                txt = preview_pdf_text(tmp, max_chars=30000)
-                master_sections.append(txt)
-            except Exception as e:
-                master_sections.append(f"(Failed to extract PDF text: {e})")
-            finally:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-    else:
-        master_sections.append("\n=== ASSIGNMENT ADDITIONAL FILES ===\n(None found)")
+    return ""
 
-    master_text = "\n".join(master_sections)
-    save_assignment_master(ASSIGNMENTS_DIR, COURSE_ID, ASSIGNMENT_ID, master_text)
 
-    # 5) Fetch submissions
-    submissions = call_moodle("mod_assign_get_submissions", {"assignmentids[0]": ASSIGNMENT_ID})
-    files, texts = extract_submission_files_and_text(submissions)
+# =========================
+# MAIN PIPELINE
+# =========================
+def main():
+    due = get_assignment_due_date(COURSE_ID, ASSIGNMENT_ID)
+    now = int(time.time())
 
-    # 6) Merge content per student
-    submission_map = {}
+    print("Due date:", due, datetime.fromtimestamp(due).isoformat() if due else "None")
+    print("Now:", now, datetime.fromtimestamp(now).isoformat())
 
-    for t in texts:
-        key = (t["userid"], t["submissionid"])
-        submission_map.setdefault(key, [])
-        submission_map[key].append("=== ONLINE TEXT SUBMISSION ===\n" + t["plain"] + "\n")
+    subs = get_submissions(ASSIGNMENT_ID)
+    print("Submissions found:", len(subs))
 
-    for f in files:
-        filename = f["filename"] or ""
-        mimetype = (f["mimetype"] or "").lower()
-        is_pdf = ("pdf" in mimetype) or filename.lower().endswith(".pdf")
+    for sub in subs:
+        moodle_submission_id = sub.get("id")
+        student_id = sub.get("userid")
 
-        if not is_pdf or not f["fileurl"]:
+        raw_text = get_submission_text(sub)
+
+        if not raw_text.strip():
+            print(f"⚠️ submission {moodle_submission_id} (user {student_id}) text empty. (online text missing + pdf failed or scanned)")
             continue
 
-        key = (f["userid"], f["submissionid"])
-        submission_map.setdefault(key, [])
+        # 1) Ingest -> backend
+        ingest = backend_post("/ingest/submission", {
+            "moodle_submission_id": moodle_submission_id,
+            "assignment_id": ASSIGNMENT_ID,
+            "course_id": COURSE_ID,
+            "student_id": student_id,
+            "raw_text": raw_text
+        })
+        submission_db_id = ingest["id"]
+        print(f"✅ ingested submission {moodle_submission_id} -> backend id: {submission_db_id}")
 
-        token_url = add_token_to_fileurl(f["fileurl"])
-        temp_pdf = f"temp_{f['userid']}_{f['submissionid']}_{safe_name(filename)}"
-        download_file(token_url, temp_pdf)
+        # 2) Plagiarism check
+        plag = backend_post(f"/plagiarism/check/{submission_db_id}?threshold={PLAG_THRESHOLD}", {})
+        print(f"🔎 plagiarism flagged_count={plag.get('flagged_count', 0)} for backend submission {submission_db_id}")
 
-        try:
-            pdf_text = preview_pdf_text(temp_pdf, max_chars=30000)
-        except Exception:
-            pdf_text = "(PDF text extraction failed)"
-        finally:
-            if os.path.exists(temp_pdf):
-                os.remove(temp_pdf)
+        # 3) Deadline gating
+        if due and now < due:
+            print("⏳ Before deadline -> NOT grading yet (waiting_deadline)")
+            continue
 
-        submission_map[key].append("=== PDF SUBMISSION TEXT ===\n" + pdf_text + "\n")
+        # 4) After deadline -> grade
+        graded = backend_post(f"/llm/multi_grade/{submission_db_id}", {})
+        result = graded.get("multi_agent", {})
+        grade = float(result.get("grade", 0))
+        feedback = result.get("final_feedback", "")
 
-    # 7) Save output files
-    if not submission_map:
-        print("\n⚠️ No submissions found yet for this assignment.")
-    else:
-        for (student_id, submission_id), parts in submission_map.items():
-            final_text = (
-                f"STUDENT ID: {student_id}\n"
-                f"COURSE ID: {COURSE_ID}\n"
-                f"ASSIGNMENT ID: {ASSIGNMENT_ID}\n"
-                f"SUBMISSION ID: {submission_id}\n\n"
-                + "\n".join(parts)
-            )
-            save_student_submission_text(SUBMISSIONS_DIR, student_id, COURSE_ID, ASSIGNMENT_ID, final_text)
+        # Optional: if flagged, don’t auto-push grade
+        if plag.get("flagged_count", 0) > 0:
+            feedback = "⚠️ Plagiarism warning: similarity flagged.\n\n" + feedback
+            # You can choose to skip pushing grade here if you want:
+            # print("🚫 Flagged plagiarism -> skipping grade push (needs manual review)")
+            # continue
 
-    print("\n✅ All processed.")
+        # 5) Push grade to Moodle
+        push_grade_to_moodle(ASSIGNMENT_ID, student_id, grade, feedback)
+        print(f"✅ pushed to Moodle | user={student_id} grade={grade}")
+
+    print("\n✅ Scheduler run complete.")
 
 
 if __name__ == "__main__":

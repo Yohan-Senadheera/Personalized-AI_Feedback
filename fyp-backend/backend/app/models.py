@@ -3,7 +3,11 @@ from sqlalchemy import UniqueConstraint, ForeignKey
 from sqlalchemy.sql import func
 from backend.app.db import Base
 from sqlalchemy import Float, JSON
+from sqlalchemy import Column, Integer, UniqueConstraint
 
+__table_args__ = (
+    UniqueConstraint("moodle_submission_id", name="uq_moodle_submission_id"),
+)
 class Submission(Base):
     __tablename__ = "submissions"
 

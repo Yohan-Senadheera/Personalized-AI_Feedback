@@ -21,6 +21,9 @@ from backend.app.multi_agent import run_multi_agent
 import json
 from backend.app.models import ConceptHistory, StudentProfile
 from backend.app.profile import pick_weak_concepts, calc_trend, summarize_feedback
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from backend.app.db import get_db
 
 app = FastAPI(title="FYP Feedback Backend")
 Base.metadata.create_all(bind=engine)
@@ -46,16 +49,58 @@ class SubmissionIn(BaseModel):
 def ingest_submission(data: SubmissionIn):
     db = SessionLocal()
     try:
-        source_text = data.cleaned_text or data.raw_text
-
-        if not source_text or not source_text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="raw_text or cleaned_text must be provided and not empty"
-            )
+        # 0) basic input
+        source_text = (data.cleaned_text or data.raw_text or "").strip()
+        if not source_text:
+            raise HTTPException(status_code=400, detail="raw_text or cleaned_text must be provided and not empty")
 
         cleaned = clean_text_basic(source_text)
 
+        # 1) DUPLICATE PROTECTION (idempotent)
+        existing = db.query(Submission).filter(
+            Submission.moodle_submission_id == data.moodle_submission_id
+        ).first()
+
+        if existing:
+            # If chunks already exist, just return existing submission id
+            existing_chunks = db.query(SubmissionChunk).filter(
+                SubmissionChunk.submission_id == existing.id
+            ).count()
+
+            if existing_chunks > 0:
+                return {
+                    "status": "already_exists",
+                    "id": existing.id,
+                    "chunks_saved": existing_chunks
+                }
+
+            # If NO chunks, repair by creating chunks now (rechunk)
+            existing.raw_text = data.raw_text
+            existing.cleaned_text = cleaned
+            existing.assignment_id = data.assignment_id
+            existing.course_id = data.course_id
+            existing.student_id = data.student_id
+
+            chunks = split_numbered_answers(cleaned)
+
+            for qno, chunk_text in chunks:
+                cclean = clean_text_basic(chunk_text)
+                db.add(SubmissionChunk(
+                    submission_id=existing.id,
+                    question_no=qno,
+                    chunk_text=chunk_text,
+                    cleaned_text=cclean
+                ))
+
+            db.commit()
+            return {
+                "status": "rechunked_existing",
+                "id": existing.id,
+                "chunks_saved": len(chunks),
+                "chunk_questions": [q for q, _ in chunks]
+            }
+
+        # 2) New submission insert
         submission = Submission(
             moodle_submission_id=data.moodle_submission_id,
             assignment_id=data.assignment_id,
@@ -63,14 +108,15 @@ def ingest_submission(data: SubmissionIn):
             student_id=data.student_id,
             raw_text=data.raw_text,
             cleaned_text=cleaned,
+            status="pending",
+            plagiarism_flag=False
         )
         db.add(submission)
         db.commit()
         db.refresh(submission)
 
-        # Split into chunks (Q1/Q2/Q3)
+        # 3) Create chunks
         chunks = split_numbered_answers(cleaned)
-
         for qno, chunk_text in chunks:
             cclean = clean_text_basic(chunk_text)
             db.add(SubmissionChunk(
@@ -79,7 +125,6 @@ def ingest_submission(data: SubmissionIn):
                 chunk_text=chunk_text,
                 cleaned_text=cclean
             ))
-
         db.commit()
 
         return {
@@ -92,9 +137,9 @@ def ingest_submission(data: SubmissionIn):
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-
     finally:
         db.close()
+
 
 
 @app.post("/plagiarism/check/{submission_id}")
@@ -461,3 +506,21 @@ def moodle_push_payload(submission_id: int):
     finally:
         db.close()
 
+
+router = APIRouter(prefix="/submission", tags=["submission"])
+app.include_router(router)
+
+@router.get("/by_moodle/{moodle_submission_id}")
+def get_by_moodle_id(moodle_submission_id: int, db: Session = Depends(get_db)):
+    sub = db.query(Submission).filter(Submission.moodle_submission_id == moodle_submission_id).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Not found")
+    return {
+        "id": sub.id,
+        "moodle_submission_id": sub.moodle_submission_id,
+        "student_id": sub.student_id,
+        "assignment_id": sub.assignment_id,
+        "course_id": sub.course_id,
+        "status": getattr(sub, "status", None),
+        "plagiarism_flag": getattr(sub, "plagiarism_flag", None),
+    }

@@ -12,28 +12,29 @@ def split_numbered_answers(text: str) -> List[Tuple[int, str]]:
       Q 2) ...
       Question 3: ...
     Returns list of (question_no, chunk_text)
+
+    Fallback:
+    - if numbering is not detected, return the whole text as Q1
     """
     text = (text or "").strip()
     if not text:
         return []
 
-    # Match a question header at the START of a LINE
-    # Captures the question number in group(1)
     pattern = re.compile(
-        r"""(?mix)                 # m=multiline, i=ignorecase, x=verbose
-        ^\s*                       # line start + optional spaces
-        (?:question\s*)?           # optional "Question"
-        (?:q\s*)?                  # optional "Q"
-        (\d{1,3})                  # question number (1-999)
-        \s*                        # optional spaces
-        (?:[\.\)\:\-–—])           # delimiter: . ) : - – —
-        \s+                        # at least one space after delimiter
+        r"""(?mix)
+        ^\s*
+        (?:question\s*)?
+        (?:q\s*)?
+        (\d{1,3})
+        \s*
+        (?:[\.\)\:\-–—])
+        \s+
         """,
     )
 
     matches = list(pattern.finditer(text))
     if not matches:
-        return []
+        return [(1, text)]
 
     chunks: List[Tuple[int, str]] = []
     for i, m in enumerate(matches):
@@ -43,6 +44,9 @@ def split_numbered_answers(text: str) -> List[Tuple[int, str]]:
         chunk = text[start:end].strip()
         if chunk:
             chunks.append((qno, chunk))
+
+    if not chunks:
+        return [(1, text)]
 
     return chunks
 

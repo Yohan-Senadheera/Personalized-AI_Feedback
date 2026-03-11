@@ -1,4 +1,7 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import time
 import re
 import html
@@ -13,8 +16,9 @@ import pdfplumber
 # CONFIG (edit or use env)
 # =========================
 MOODLE_URL = os.getenv("MOODLE_URL", "http://localhost:8080/moodle")
-MOODLE_TOKEN = os.getenv("MOODLE_TOKEN", "ef6d0d7a10b807c02a779fded5d568bf")
-
+MOODLE_TOKEN = "ef6d0d7a10b807c02a779fded5d568bf"
+# if not MOODLE_TOKEN:
+#     raise RuntimeError("MOODLE_TOKEN is missing in environment")
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 COURSE_ID = int(os.getenv("COURSE_ID", "2"))
@@ -123,11 +127,6 @@ def backend_post(path: str, payload: dict | None = None):
 # Moodle grade push
 # =========================
 def push_grade_to_moodle(assign_id: int, user_id: int, grade: float, feedback: str):
-    """
-    Push grade + feedback to Moodle.
-    NOTE: feedbackformat may differ depending on Moodle config.
-    1 = HTML is usually fine.
-    """
     return moodle_call(
         "mod_assign_save_grade",
         **{
@@ -137,11 +136,11 @@ def push_grade_to_moodle(assign_id: int, user_id: int, grade: float, feedback: s
             "attemptnumber": -1,
             "addattempt": 0,
             "workflowstate": "graded",
-            "feedbacktext": feedback,
-            "feedbackformat": 1,
+            "applytoall": 0,
+            "plugindata[assignfeedbackcomments_editor][text]": feedback,
+            "plugindata[assignfeedbackcomments_editor][format]": 1,
         }
     )
-
 
 # =========================
 # Fetch due date + submissions
@@ -154,6 +153,16 @@ def get_assignment_due_date(course_id: int, assignment_id: int) -> int:
                 return int(a.get("duedate") or 0)
     return 0
 
+
+def get_assignment_meta(course_id: int, assignment_id: int) -> tuple[str, str]:
+    data = moodle_call("mod_assign_get_assignments", **{"courseids[0]": course_id})
+    for c in data.get("courses", []):
+        for a in c.get("assignments", []):
+            if a.get("id") == assignment_id:
+                title = a.get("name") or f"Assignment {assignment_id}"
+                prompt = strip_html_to_text(a.get("intro") or "")
+                return title, prompt
+    return f"Assignment {assignment_id}", ""
 
 def get_submissions(assignment_id: int) -> list[dict]:
     data = moodle_call("mod_assign_get_submissions", **{"assignmentids[0]": assignment_id})
@@ -230,6 +239,7 @@ def main():
     print("Now:", now, datetime.fromtimestamp(now).isoformat())
 
     subs = get_submissions(ASSIGNMENT_ID)
+    assignment_title, assignment_prompt = get_assignment_meta(COURSE_ID, ASSIGNMENT_ID)
     print("Submissions found:", len(subs))
 
     for sub in subs:
@@ -248,6 +258,8 @@ def main():
             "assignment_id": ASSIGNMENT_ID,
             "course_id": COURSE_ID,
             "student_id": student_id,
+            "assignment_title": assignment_title,
+            "assignment_prompt": assignment_prompt,
             "raw_text": raw_text
         })
         submission_db_id = ingest["id"]

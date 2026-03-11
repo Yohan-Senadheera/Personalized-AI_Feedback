@@ -1,8 +1,14 @@
 import requests
 
-MOODLE_URL = "http://localhost:8080/moodle"
-TOKEN = "YOUR_TOKEN"
-BACKEND_URL = "http://127.0.0.1:8000"
+import os
+import requests
+
+MOODLE_URL = os.getenv("MOODLE_URL", "http://localhost:8080/moodle")
+TOKEN = os.getenv("MOODLE_TOKEN", "")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
+
+if not TOKEN:
+    raise RuntimeError("MOODLE_TOKEN is missing")
 
 def moodle_call(function_name, params):
     url = f"{MOODLE_URL}/webservice/rest/server.php"

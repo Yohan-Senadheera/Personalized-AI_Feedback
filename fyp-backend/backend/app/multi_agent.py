@@ -1,228 +1,802 @@
-from typing import Dict, Any
+from typing import Dict, Any, List
 from backend.app.llm import get_llm
+import re
+import json
+
+print("LOADED LIVE multi_agent.py")
 
 
 def _cap(s: str, n: int) -> str:
+    return (s or "").strip()[:n]
+
+
+def _norm(s: str) -> str:
     s = (s or "").strip()
-    return s[:n]
+    s = s.replace("ﬁ", "fi").replace("ﬂ", "fl").replace("traƯic", "traffic")
+    s = s.replace("\r", "\n")
+    return s
 
 
-def compute_grade_from_qscores(q_scores: dict) -> int:
-    """
-    Deterministic grade from q_scores.
-    Expects keys: Q1, Q2, Q3 with values 0..3 (ints).
-    Total max = 9 => grade out of 100.
-    """
-    total = 0
-    for k in ["Q1", "Q2", "Q3"]:
-        try:
-            total += int(q_scores.get(k, 0))
-        except Exception:
-            total += 0
-    grade = round((total / 9) * 100)
-    return max(0, min(100, grade))
+def _strip_html(s: str) -> str:
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</p>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n\s+\n", "\n\n", s)
+    return s.strip()
 
 
-def run_multi_agent(qmap: Dict[int, str], student_context: Dict[str, Any]) -> Dict[str, Any]:
-    llm = get_llm()
+def _safe_float(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
 
-    # --- Token saver: cap answer text sent to LLM ---
-    q1 = _cap(qmap.get(1, ""), 600)
-    q2 = _cap(qmap.get(2, ""), 600)
-    q3 = _cap(qmap.get(3, ""), 600)
 
-    # Agent 1: correctness (short)
-    corr = llm.generate_json(
-        system="You are the Correctness Agent. Return STRICT JSON only.",
-        user=f"""
-Correctness Agent (BE BRIEF)
-Student answers:
-Q1: {q1}
-Q2: {q2}
-Q3: {q3}
+def _safe_int(v, default=0):
+    try:
+        return int(round(float(v)))
+    except Exception:
+        return default
 
-Return STRICT JSON:
-{{
-  "q_scores": {{"Q1": 0-3, "Q2": 0-3, "Q3": 0-3}},
-  "key_points_found": {{"Q1":[max 3], "Q2":[max 3], "Q3":[max 3]}}
-}}
-""",
-    )
 
-    # ✅ Deterministic grade (no LLM grade drift)
-    grade = compute_grade_from_qscores(corr.get("q_scores", {}))
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
 
-    # Agent 2: misconceptions (very short)
-    misc = llm.generate_json(
-        system="You are the Misconception Agent. Return STRICT JSON only.",
-        user=f"""
-Misconception Agent (VERY BRIEF)
-For each question return:
-- misconceptions: max 1 short sentence
-- missing_points_top: max 2 bullet phrases
 
-Student answers:
-Q1: {q1}
-Q2: {q2}
-Q3: {q3}
+def _avg(values: List[float]):
+    vals = [x for x in values if isinstance(x, (int, float))]
+    if not vals:
+        return None
+    return round(sum(vals) / len(vals), 2)
 
-Return STRICT JSON:
-{{
-  "Q1": {{"misconceptions":[...], "missing_points_top":[...]}},
-  "Q2": {{"misconceptions":[...], "missing_points_top":[...]}},
-  "Q3": {{"misconceptions":[...], "missing_points_top":[...]}}
-}}
-""",
-    )
 
-    # Agent 3: clarity (force single object, not list)
-    clarity = llm.generate_json(
-        system="You are the Clarity Agent. Return STRICT JSON only.",
-        user=f"""
-Clarity Agent (VERY BRIEF)
-Return EXACTLY ONE JSON OBJECT (NOT a list):
-{{"clarity_score": 0-10, "writing_suggestions": [max 2 short bullets]}}
+def _tokenize_words(s: str) -> List[str]:
+    s = _norm(s).lower()
+    return re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]{2,}", s)
 
-Answers:
-Q1: {q1}
-Q2: {q2}
-Q3: {q3}
-""",
-    )
-    if isinstance(clarity, list) and clarity:
-        clarity = clarity[0]
 
-    # Agent 4: personalization (minimal context)
-    ctx = {
-        "weak_concepts": student_context.get("weak_concepts", []),
-        "trend": student_context.get("trend", "unknown"),
-        "last_feedback_summary": _cap(student_context.get("last_feedback_summary", ""), 200),
+def _extract_questions_from_prompt(prompt: str) -> List[dict]:
+    text = _strip_html(_norm(prompt))
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+
+    questions = []
+    for line in lines:
+        m = re.match(r"^(\d+)[\.\)]\s*(.+)$", line)
+        if m:
+            qno = int(m.group(1))
+            qtext = m.group(2).strip()
+            questions.append({"qno": qno, "question": qtext})
+
+    return questions
+
+
+def _concepts_from_question_text(question: str, qno: int) -> List[str]:
+    q = _norm(question).lower()
+
+    manual = []
+    keyword_map = {
+        "docker image": "docker_image",
+        "image": "docker_image",
+        "docker container": "docker_container",
+        "container": "docker_container",
+        "docker compose": "docker_compose",
+        "compose": "docker_compose",
+        "containerization": "containerization",
+        "kubernetes service": "kubernetes_service",
+        "service": "service_concept",
+        "clusterip": "clusterip",
+        "nodeport": "nodeport",
+        "networkpolicy": "networkpolicy",
+        "network policy": "networkpolicy",
+        "ingress": "ingress",
+        "loadbalancer": "loadbalancer",
+        "pod": "pod_networking",
     }
 
-    pers = llm.generate_json(
-        system="You are the Personalization Agent. Return STRICT JSON only.",
+    for k, v in keyword_map.items():
+        if k in q and v not in manual:
+            manual.append(v)
+
+    if not manual:
+        words = _tokenize_words(question)
+        manual = words[:2] if words else [f"q{qno}_understanding"]
+
+    return manual[:4]
+
+
+def _fallback_rubric(question_defs: List[dict], qmap: Dict[int, str]) -> List[dict]:
+    out = []
+    seen = set()
+
+    for q in question_defs:
+        qno = _safe_int(q.get("qno"), 0)
+        if qno <= 0:
+            continue
+        question = (q.get("question") or f"Question {qno}").strip()
+        out.append({
+            "qno": qno,
+            "question": question,
+            "max_score": 3,
+            "criteria": [
+                "Correct core idea",
+                "Relevant technical detail",
+                "Clear explanation or example",
+            ],
+            "concepts": _concepts_from_question_text(question, qno),
+        })
+        seen.add(qno)
+
+    for qno in sorted(qmap.keys()):
+        if qno not in seen:
+            out.append({
+                "qno": qno,
+                "question": f"Question {qno}",
+                "max_score": 3,
+                "criteria": [
+                    "Correct core idea",
+                    "Relevant technical detail",
+                    "Clear explanation or example",
+                ],
+                "concepts": [f"q{qno}_understanding"],
+            })
+
+    out.sort(key=lambda x: x["qno"])
+    return out
+
+
+def _normalize_rubric(rubric_questions: List[dict], fallback_questions: List[dict]) -> List[dict]:
+    fallback_by_qno = {x["qno"]: x for x in fallback_questions}
+    out = []
+
+    for item in rubric_questions or []:
+        qno = _safe_int(item.get("qno"), 0)
+        if qno <= 0 or qno not in fallback_by_qno:
+            continue
+
+        fb = fallback_by_qno[qno]
+        max_score = _clamp(_safe_int(item.get("max_score", fb["max_score"]), fb["max_score"]), 1, 10)
+        question = (item.get("question") or fb["question"]).strip()
+        criteria = [str(x).strip() for x in (item.get("criteria") or []) if str(x).strip()][:6]
+        concepts = [str(x).strip() for x in (item.get("concepts") or []) if str(x).strip()][:6]
+
+        if len(criteria) < 2:
+            criteria = fb["criteria"]
+        if not concepts:
+            concepts = fb["concepts"]
+
+        out.append({
+            "qno": qno,
+            "question": question,
+            "max_score": max_score,
+            "criteria": criteria,
+            "concepts": concepts,
+        })
+
+    seen = {x["qno"] for x in out}
+    for fb in fallback_questions:
+        if fb["qno"] not in seen:
+            out.append(fb)
+
+    out.sort(key=lambda x: x["qno"])
+    return out
+
+
+def _normalize_eval(eval_json: dict, rubric_questions: List[dict]) -> dict:
+    per_question = eval_json.get("per_question", {}) if isinstance(eval_json, dict) else {}
+    out = {}
+
+    for rq in rubric_questions:
+        qno = rq["qno"]
+        key = f"Q{qno}"
+        item = per_question.get(key, {}) if isinstance(per_question, dict) else {}
+
+        max_score = _clamp(_safe_int(item.get("max_score", rq["max_score"]), rq["max_score"]), 1, 10)
+        score = _clamp(_safe_int(item.get("score", 0), 0), 0, max_score)
+
+        reason = (item.get("reason") or "").strip()
+        strengths = [str(x).strip() for x in (item.get("strengths") or []) if str(x).strip()][:3]
+        gaps = [str(x).strip() for x in (item.get("gaps") or []) if str(x).strip()][:3]
+        concepts = [str(x).strip() for x in (item.get("concepts") or rq.get("concepts") or []) if str(x).strip()][:6]
+
+        out[key] = {
+            "score": score,
+            "max_score": max_score,
+            "reason": reason,
+            "strengths": strengths,
+            "gaps": gaps,
+            "concepts": concepts,
+        }
+
+    overall_strengths = [str(x).strip() for x in (eval_json.get("overall_strengths") or []) if str(x).strip()][:4]
+    overall_weaknesses = [str(x).strip() for x in (eval_json.get("overall_weaknesses") or []) if str(x).strip()][:4]
+    next_steps = [str(x).strip() for x in (eval_json.get("next_steps") or []) if str(x).strip()][:4]
+
+    concept_scores = eval_json.get("concept_scores") or {}
+    concept_scores_norm = {}
+    if isinstance(concept_scores, dict):
+        for k, v in concept_scores.items():
+            kk = str(k).strip()
+            if kk:
+                concept_scores_norm[kk] = round(_clamp(_safe_float(v, 0.0), 0.0, 1.0), 2)
+
+    confidence = round(_clamp(_safe_float(eval_json.get("confidence", 0.55), 0.55), 0.0, 1.0), 2)
+
+    return {
+        "per_question": out,
+        "overall_strengths": overall_strengths,
+        "overall_weaknesses": overall_weaknesses,
+        "next_steps": next_steps,
+        "concept_scores": concept_scores_norm,
+        "confidence": confidence,
+    }
+
+
+def _derive_concept_scores(per_question: dict) -> dict:
+    bucket = {}
+    for _, item in per_question.items():
+        max_score = max(1, item["max_score"])
+        ratio = round(item["score"] / max_score, 2)
+        for c in item.get("concepts", []):
+            bucket.setdefault(c, []).append(ratio)
+
+    return {k: round(sum(v) / len(v), 2) for k, v in bucket.items() if v}
+
+
+def _compute_grade(per_question: dict) -> int:
+    total = 0
+    total_max = 0
+    for _, item in per_question.items():
+        total += item["score"]
+        total_max += item["max_score"]
+
+    if total_max <= 0:
+        return 0
+    return int(round((total / total_max) * 100))
+
+
+def _filter_personalization_to_assignment(student_context: Dict[str, Any], rubric_questions: List[dict]) -> Dict[str, Any]:
+    active_concepts = set()
+    for rq in rubric_questions:
+        for c in rq.get("concepts", []) or []:
+            if c:
+                active_concepts.add(c)
+
+    raw_weak = student_context.get("weak_concepts", []) or []
+    filtered_weak = [c for c in raw_weak if c in active_concepts]
+
+    recent_concepts = student_context.get("recent_concepts", []) or []
+    filtered_recent = []
+    for row in recent_concepts:
+        if isinstance(row, dict):
+            filtered_recent.append({
+                k: v for k, v in row.items()
+                if k in active_concepts and isinstance(v, (int, float))
+            })
+
+    return {
+        **student_context,
+        "weak_concepts": filtered_weak,
+        "recent_concepts": filtered_recent,
+    }
+
+
+def _build_personalization_context(student_context: Dict[str, Any]) -> Dict[str, Any]:
+    recent_concepts = student_context.get("recent_concepts", []) or []
+
+    concept_names = set()
+    for row in recent_concepts:
+        if isinstance(row, dict):
+            concept_names.update(row.keys())
+
+    recent_concepts_avg = {}
+    for c in concept_names:
+        vals = []
+        for row in recent_concepts:
+            if isinstance(row, dict):
+                v = row.get(c)
+                if isinstance(v, (int, float)):
+                    vals.append(float(v))
+        avg = _avg(vals)
+        if avg is not None:
+            recent_concepts_avg[c] = avg
+
+    return {
+        "weak_concepts": student_context.get("weak_concepts", []) or [],
+        "trend": student_context.get("trend", "unknown"),
+        "recent_grades": (student_context.get("recent_grades", []) or [])[-3:],
+        "recent_feedback_summaries": (student_context.get("recent_feedback_summaries", []) or [])[-2:],
+        "recent_concepts_avg": recent_concepts_avg,
+        "plagiarism_flag": bool(student_context.get("plagiarism_flag", False)),
+    }
+
+
+def _fallback_reason(score: int, max_score: int, question: str) -> str:
+    if score >= max_score:
+        return f"Strong answer for: {question}"
+    if score == 0:
+        return f"Answer is incorrect, missing, or not aligned with the question: {question}"
+    return f"Partially correct answer for: {question}"
+
+
+def _looks_wrong_for_docker_q1(answer: str) -> bool:
+    a = answer.lower()
+    bad_markers = [
+        "same as a container",
+        "same as container",
+        "another name for it",
+        "installed one",
+    ]
+    return any(x in a for x in bad_markers)
+
+
+def _looks_wrong_for_docker_q2(answer: str) -> bool:
+    a = answer.lower()
+    bad_markers = [
+        "make docker faster",
+        "improve internet connection",
+        "faster internet",
+        "internet connection between containers",
+    ]
+    return any(x in a for x in bad_markers)
+
+
+def _looks_weak_for_docker_q3(answer: str) -> bool:
+    a = answer.lower()
+    bad_markers = [
+        "run more quickly than normal programs",
+        "makes code run more quickly",
+    ]
+    return any(x in a for x in bad_markers)
+
+
+def _heuristic_score_answer(question: str, answer: str, max_score: int) -> int:
+    ql = question.lower()
+    al = answer.lower()
+
+    if "docker image" in ql and "container" in ql:
+        if _looks_wrong_for_docker_q1(answer):
+            return 0
+        if ("read-only" in al or "template" in al or "contains" in al) and ("running instance" in al or "running version" in al):
+            return max_score
+        if "used to create a container" in al and "running version" in al:
+            return max_score - 1
+        return 0
+
+    if "docker compose" in ql:
+        if _looks_wrong_for_docker_q2(answer):
+            return 0
+        if ("run them together" in al or "multiple containers" in al or "multi-container" in al) and ("development" in al or "simpler" in al or "saves time" in al or "one command" in al):
+            return max_score - 1
+        if "multiple containers" in al or "run together" in al:
+            return 1
+        return 0
+
+    if "containerization" in ql or "practical example" in ql:
+        if _looks_weak_for_docker_q3(answer):
+            return 0
+        if ("backend" in al and "database" in al) or ("same environment" in al) or ("deploy" in al) or ("developer" in al and "machine" in al):
+            return max_score - 1
+        if "container" in al or "environment" in al:
+            return 1
+        return 0
+
+    q_words = set(_tokenize_words(question))
+    a_words = set(_tokenize_words(answer))
+    overlap = len(q_words.intersection(a_words))
+    answer_len = len(a_words)
+
+    if answer_len == 0:
+        return 0
+    if overlap >= 4 and answer_len >= 12:
+        return max_score
+    if overlap >= 2 and answer_len >= 8:
+        return max(1, max_score - 1)
+    if answer_len >= 8:
+        return 1
+    return 0
+
+
+def _fallback_evaluate_answers(rubric_questions: List[dict], qmap: Dict[int, str]) -> dict:
+    per_question = {}
+    overall_strengths = []
+    overall_weaknesses = []
+    next_steps = []
+
+    for rq in rubric_questions:
+        qno = rq["qno"]
+        key = f"Q{qno}"
+        answer = _norm(qmap.get(qno, ""))
+        question = rq["question"]
+        concepts = rq.get("concepts", [])
+        max_score = rq["max_score"]
+
+        score = _heuristic_score_answer(question, answer, max_score)
+        reason = _fallback_reason(score, max_score, question)
+
+        strengths = []
+        gaps = []
+
+        if score == max_score:
+            strengths.append(f"You addressed {key} well.")
+            overall_strengths.append(f"{key} was strong.")
+        elif score == 0:
+            gaps.append(f"{key} needs a more accurate answer.")
+            overall_weaknesses.append(f"{key} was incorrect or too weak.")
+            next_steps.append(f"Review the expected technical points for {key} and answer with more precision.")
+        else:
+            strengths.append(f"{key} is partly correct.")
+            gaps.append(f"{key} needs more technical detail.")
+            overall_weaknesses.append(f"{key} needs more depth.")
+            next_steps.append(f"Review the expected technical points for {key} and answer with more precision.")
+
+        per_question[key] = {
+            "score": score,
+            "max_score": max_score,
+            "reason": reason,
+            "strengths": strengths[:3],
+            "gaps": gaps[:3],
+            "concepts": concepts[:6],
+        }
+
+    concept_scores = _derive_concept_scores(per_question)
+
+    return {
+        "per_question": per_question,
+        "overall_strengths": overall_strengths[:4],
+        "overall_weaknesses": overall_weaknesses[:4],
+        "next_steps": next_steps[:4],
+        "concept_scores": concept_scores,
+        "confidence": 0.35,
+    }
+
+
+def _needs_eval_fallback(evaluation: dict) -> bool:
+    per_question = evaluation.get("per_question", {})
+    if not per_question:
+        return True
+
+    total_questions = 0
+    nonempty_reason = 0
+    for _, item in per_question.items():
+        total_questions += 1
+        if item.get("reason"):
+            nonempty_reason += 1
+
+    if total_questions == 0:
+        return True
+    if nonempty_reason == 0:
+        return True
+    return False
+
+
+def _looks_suspicious(evaluation: dict, answers_payload: List[dict]) -> bool:
+    perq = evaluation.get("per_question", {})
+    if not perq:
+        return True
+
+    for ans in answers_payload:
+        key = f"Q{ans['qno']}"
+        item = perq.get(key, {})
+        answer = (ans.get("answer") or "").lower()
+        score = int(item.get("score", 0))
+        max_score = int(item.get("max_score", 3))
+
+        if _looks_wrong_for_docker_q1(answer) and score >= 2:
+            return True
+        if _looks_wrong_for_docker_q2(answer) and score >= 2:
+            return True
+        if _looks_weak_for_docker_q3(answer) and score >= 2:
+            return True
+
+    return False
+
+
+def _feedback_looks_generic(text: str, assignment_title: str, assignment_prompt: str = "") -> bool:
+    t = _norm(text).lower()
+    if not t:
+        return True
+
+    assignment_text = f"{assignment_title} {assignment_prompt}".lower()
+    is_k8s = any(x in assignment_text for x in [
+        "kubernetes", "clusterip", "nodeport", "networkpolicy", "ingress", "loadbalancer", "service"
+    ])
+
+    bad_patterns = ["good work overall"]
+
+    # Only treat k8s-only terms as suspicious when the assignment is NOT k8s
+    if not is_k8s:
+        bad_patterns.extend([
+            "label-selector",
+            "ingress/loadbalancer",
+            "clusterip",
+            "nodeport",
+            "networkpolicy",
+        ])
+
+    return any(x in t for x in bad_patterns)
+
+
+def _build_fallback_feedback(
+    assignment_title: str,
+    evaluation: dict,
+    personalization_context: dict,
+    grade: int,
+) -> dict:
+    per_question = evaluation["per_question"]
+
+    parts = [f"You scored {grade}/100 on {assignment_title}."]
+    strengths = []
+    weaknesses = []
+    next_steps = []
+
+    for key in sorted(per_question.keys()):
+        item = per_question[key]
+        parts.append(f"{key}: {item['reason']}")
+        strengths.extend(item.get("strengths", []))
+        weaknesses.extend(item.get("gaps", []))
+
+    trend = personalization_context.get("trend", "unknown")
+    weak_concepts = personalization_context.get("weak_concepts", []) or []
+
+    if trend != "unknown":
+        parts.append(f"Your recent trend is {trend}.")
+    if weak_concepts:
+        parts.append("Focus especially on: " + ", ".join(weak_concepts[:3]) + ".")
+
+    for key in sorted(per_question.keys()):
+        item = per_question[key]
+        if item["score"] < item["max_score"]:
+            next_steps.append(f"Review the expected technical points for {key} and answer with more precision.")
+
+    return {
+        "final_feedback": " ".join(parts),
+        "strengths": strengths[:3],
+        "weaknesses": weaknesses[:3],
+        "next_steps": next_steps[:3],
+        "confidence": 0.55,
+    }
+
+
+def run_multi_agent(
+    qmap: Dict[int, str],
+    student_context: Dict[str, Any],
+    assignment_context: Dict[str, Any] | None = None
+) -> Dict[str, Any]:
+    llm = get_llm()
+    print("RUNNING LIVE run_multi_agent")
+
+    assignment_context = assignment_context or {}
+    assignment_title = (assignment_context.get("assignment_title") or "Assignment").strip()
+    assignment_prompt = _strip_html(assignment_context.get("assignment_prompt") or "")
+
+    question_defs = _extract_questions_from_prompt(assignment_prompt)
+    if not question_defs:
+        question_defs = [{"qno": qno, "question": f"Question {qno}"} for qno in sorted(qmap.keys())]
+
+    fallback_rubric = _fallback_rubric(question_defs, qmap)
+
+    answers_payload = []
+    for q in fallback_rubric:
+        qno = q["qno"]
+        answers_payload.append({
+            "qno": qno,
+            "question": q["question"],
+            "answer": _cap(_norm(qmap.get(qno, "")), 2000),
+        })
+
+    rubric_json = llm.generate_json(
+        system="You are the Rubric Interpreter Agent. Return STRICT JSON only.",
         user=f"""
-Personalization Agent (BE BRIEF)
-Student context: {ctx}
+Assignment title:
+{assignment_title}
+
+Assignment prompt:
+{assignment_prompt}
+
+Detected questions:
+{json.dumps(question_defs, ensure_ascii=False)}
+
+Create a grading rubric for each question.
+
+Rules:
+- If no explicit marks are given, use max_score = 3 for each question.
+- For each question, write 3 to 5 concrete expected points.
+- Criteria must be specific to the actual question, not generic.
+- Concepts must be assignment-topic concepts only.
+- Do not mention Kubernetes unless the assignment is about Kubernetes.
+- Do not mention Docker unless the assignment is about Docker.
+- Return one entry for every detected question.
 
 Return STRICT JSON:
 {{
-  "personalized_notes": "max 2 sentences",
-  "recommended_next_topics": [max 3 topics]
+  "questions": [
+    {{
+      "qno": 1,
+      "question": "text",
+      "max_score": 3,
+      "criteria": [
+        "specific expected point 1",
+        "specific expected point 2",
+        "specific expected point 3"
+      ],
+      "concepts": ["concept_a", "concept_b"]
+    }}
+  ]
 }}
-
-Short answers:
-Q1: {_cap(q1, 300)}
-Q2: {_cap(q2, 300)}
-Q3: {_cap(q3, 300)}
-""",
+"""
     )
 
-    # Synthesizer (NO grade; we inject grade ourselves)
-    synth = llm.generate_json(
-        system="You are the Feedback Synthesizer. Return STRICT JSON only.",
+    rubric_questions = _normalize_rubric(rubric_json.get("questions", []), fallback_rubric)
+
+    student_context = _filter_personalization_to_assignment(student_context, rubric_questions)
+    personalization_context = _build_personalization_context(student_context)
+
+    eval_json = llm.generate_json(
+        system="You are a strict academic grader. Return STRICT JSON only.",
         user=f"""
-SYNTHESIZER (VERY SHORT OUTPUT)
-Do NOT teach. Do NOT write long paragraphs.
-Follow limits strictly.
+Grade the student's answers using the rubric.
 
-Inputs:
-Correctness: {corr}
-Misconceptions: {misc}
-Clarity: {clarity}
-Personalization: {pers}
+Assignment title:
+{assignment_title}
 
-Return STRICT JSON exactly with these keys:
+Rubric:
+{json.dumps(rubric_questions, ensure_ascii=False)}
+
+Student answers:
+{json.dumps(answers_payload, ensure_ascii=False)}
+
+Return STRICT JSON:
 {{
-  "confidence": 0-1,
-  "final_feedback": "max 120 words",
-  "strengths": [max 3 short bullets],
-  "weaknesses": [max 3 short bullets],
-  "next_steps": [max 3 short bullets],
-  "concept_scores": {{"service":0-1,"clusterip_nodeport":0-1,"networkpolicy":0-1}}
+  "per_question": {{
+    "Q1": {{
+      "score": 0,
+      "max_score": 3,
+      "reason": "one or two sentences",
+      "strengths": ["..."],
+      "gaps": ["..."],
+      "concepts": ["..."]
+    }}
+  }},
+  "overall_strengths": ["..."],
+  "overall_weaknesses": ["..."],
+  "next_steps": ["..."],
+  "concept_scores": {{
+    "concept_name": 0.0
+  }},
+  "confidence": 0.0
 }}
-""",
+
+Rules:
+- score must be between 0 and max_score
+- do not award marks for vague or incorrect statements
+- if a definition is reversed or conceptually wrong, score 0
+- if an example is generic but still valid, partial credit is okay
+- be strict but fair
+- do not use markdown
+- feedback must match actual answer quality
+"""
     )
 
-    # Inject deterministic grade
-    synth["grade"] = grade
+    evaluation = _normalize_eval(eval_json, rubric_questions)
 
-    # QA (check brevity + contradiction vs q_scores)
-    qa = llm.generate_json(
+    # Only use heuristic fallback if the LLM output is missing/broken/suspicious.
+    if _needs_eval_fallback(evaluation) or _looks_suspicious(evaluation, answers_payload):
+        print("⚠️ Falling back to heuristic evaluation")
+        evaluation = _fallback_evaluate_answers(rubric_questions, qmap)
+
+    if not evaluation["concept_scores"]:
+        evaluation["concept_scores"] = _derive_concept_scores(evaluation["per_question"])
+    grade = _compute_grade(evaluation["per_question"])
+
+    feedback_json = llm.generate_json(
+        system="You are the Personalized Feedback Agent. Return STRICT JSON only.",
+        user=f"""
+Create personalized feedback using the grading result and student history.
+
+Assignment title:
+{assignment_title}
+
+Evaluation:
+{json.dumps(evaluation, ensure_ascii=False)}
+
+Student history:
+{json.dumps(personalization_context, ensure_ascii=False)}
+
+Return STRICT JSON:
+{{
+  "final_feedback": "120-220 words, specific and not generic",
+  "strengths": ["...", "..."],
+  "weaknesses": ["...", "..."],
+  "next_steps": ["...", "..."],
+  "confidence": 0.0
+}}
+
+Rules:
+- Mention the actual assignment topic
+- Do not mention Kubernetes unless this assignment is Kubernetes
+- Do not mention ClusterIP, NodePort, NetworkPolicy unless this assignment is Kubernetes
+- Do not mention label-selector, Ingress, or LoadBalancer unless relevant
+- Do not invent mistakes not present in evaluation
+- If a question is weak, mention that question specifically
+- Use the student history only when relevant
+- Do not add plagiarism warning here
+"""
+    )
+
+    final_feedback = (feedback_json.get("final_feedback") or "").strip()
+    strengths = [str(x).strip() for x in (feedback_json.get("strengths") or []) if str(x).strip()][:3]
+    weaknesses = [str(x).strip() for x in (feedback_json.get("weaknesses") or []) if str(x).strip()][:3]
+    next_steps = [str(x).strip() for x in (feedback_json.get("next_steps") or []) if str(x).strip()][:3]
+
+    print("DEBUG generic_feedback_flag:", _feedback_looks_generic(final_feedback, assignment_title, assignment_prompt))
+    # Temporarily disabled for debugging
+    # if _feedback_looks_generic(final_feedback, assignment_title, assignment_prompt):
+    #     fb = _build_fallback_feedback(
+    #         assignment_title=assignment_title,
+    #         evaluation=evaluation,
+    #         personalization_context=personalization_context,
+    #         grade=grade,
+    #     )
+    #     final_feedback = fb["final_feedback"]
+    #     strengths = fb["strengths"]
+    #     weaknesses = fb["weaknesses"]
+    #     next_steps = fb["next_steps"]
+
+    qa_json = llm.generate_json(
         system="You are the Feedback QA Agent. Return STRICT JSON only.",
         user=f"""
-Feedback QA Agent
-Check:
-1) final_feedback <= 120 words
-2) strengths/weaknesses/next_steps within limits
-3) no contradictions with q_scores:
-   - if q_scores are low, feedback must not claim "all perfect"
-   - if q_scores are max, feedback should not claim "major mistakes"
+Check whether the score, reasons, and final feedback are consistent.
+
+Assignment title:
+{assignment_title}
+
+Evaluation:
+{json.dumps(evaluation, ensure_ascii=False)}
+
+Final feedback:
+{json.dumps({
+    "final_feedback": final_feedback,
+    "strengths": strengths,
+    "weaknesses": weaknesses,
+    "next_steps": next_steps,
+    "grade": grade
+}, ensure_ascii=False)}
 
 Return STRICT JSON:
-{{"quality_score":0-1, "issues":[...], "too_long":true/false, "contradiction":true/false}}
-
-q_scores:
-{corr.get("q_scores", {})}
-
-Feedback JSON:
-{synth}
-""",
+{{
+  "quality_score": 0.0,
+  "issues": []
+}}
+"""
     )
 
-    # Auto-compress / fix once if needed
-    if qa.get("too_long") or qa.get("contradiction"):
-        synth2 = llm.generate_json(
-            system="You compress and fix feedback. Return STRICT JSON only.",
-            user=f"""
-COMPRESS & FIX
-Rewrite to be shorter and consistent with q_scores.
-Rules:
-- final_feedback max 80 words
-- strengths max 2 bullets
-- weaknesses max 2 bullets
-- next_steps max 2 bullets
-- do NOT change grade (grade is computed)
-- keep the same keys
-
-q_scores:
-{corr.get("q_scores", {})}
-
-Input JSON:
-{synth}
-
-Return STRICT JSON with SAME keys.
-""",
-        )
-
-        # Ensure grade stays deterministic
-        synth2["grade"] = grade
-
-        qa2 = llm.generate_json(
-            system="You are the Feedback QA Agent. Return STRICT JSON only.",
-            user=f"""
-QA AGAIN
-Return STRICT JSON:
-{{"quality_score":0-1, "issues":[...], "too_long":true/false, "contradiction":true/false}}
-
-q_scores:
-{corr.get("q_scores", {})}
-
-Feedback JSON:
-{synth2}
-""",
-        )
-
-        synth = synth2
-        qa = qa2
-
-    # Attach agent outputs (store for research/debug)
-    synth["agents"] = {
-        "correctness": corr,
-        "misconceptions": misc,
-        "clarity": clarity,
-        "personalization": pers,
-        "qa": qa,
+    result = {
+        "grade": grade,
+        "confidence": round(
+            _clamp(
+                _safe_float(
+                    feedback_json.get("confidence", evaluation["confidence"]),
+                    evaluation["confidence"]
+                ),
+                0.0,
+                1.0
+            ),
+            2
+        ),
+        "final_feedback": final_feedback,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "next_steps": next_steps,
+        "concept_scores": evaluation["concept_scores"],
+        "agents": {
+            "rubric": rubric_questions,
+            "correctness": evaluation,
+            "personalization_context": personalization_context,
+            "qa": qa_json,
+        },
     }
 
-    return synth
+    print("DEBUG grade:", grade)
+    print("DEBUG result:", result)
+    return result

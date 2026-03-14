@@ -225,6 +225,7 @@ def main():
         print("  feedback:", feedback)
 
         push_grade_to_moodle(ASSIGNMENT_ID, student_id, grade, feedback)
+        time.sleep(20)
         print(f"✅ pushed grade to Moodle user {student_id}: {grade}")
 
 

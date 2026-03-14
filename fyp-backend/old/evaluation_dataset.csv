@@ -1,0 +1,40 @@
+submission_id,moodle_submission_id,student_id,assignment_id,assignment_title,student_answer,ai_grade_multi,ai_feedback_multi,ai_confidence_multi,plagiarism_flag,teacher_grade,teacher_feedback,baseline_grade,baseline_feedback
+1,4,4,2,Test_Assignment_2 – Short Answer (Docker &amp; Containers),"1. A Docker image is a read-only template that contains the application code, runtime, 
+libraries, and dependencies needed to run software. A Docker container is a running 
+instance of that image. The image is like a blueprint, while the container is the live 
+executable environment created from it. Multiple containers can be started from the same 
+image. 
+ 
+2. Docker Compose helps us deﬁne and run multiple related services together using one 
+YAML ﬁle. In development, this is useful when an app depends on services like a database, 
+Redis, or backend API. It makes startup, conﬁguration, and networking easier and more 
+consistent. 
+ 
+3. Containerization is useful in a web application project where the frontend, backend, and 
+database must run consistently on every developer machine. Docker avoids “it works on 
+my machine” problems by packaging the same environment for everyone.",89,"On your 'Test_Assignment_2 – Short Answer (Docker &amp; Containers),' you demonstrated a solid grasp of Docker Compose and its utility in defining multi-container applications (Q2). Your practical example of containerization solving the 'works on my machine' problem in Q3 was also well-articulated, highlighting your ability to apply concepts. However, your response to Q1 regarding Docker images and containers revealed a critical gap in understanding their internal architecture. While you correctly distinguished between images and running instances, you missed explicitly defining a Docker container as an isolated process and did not explain the crucial concept of a writable layer on top of image layers during runtime. This specific area, particularly 'Docker Container' and 'Writable Layer,' has been identified as a persistent challenge in your learning history, contributing to a noticeable declining trend in your recent assignment scores. Addressing these fundamental concepts is vital for building a robust understanding of container technology. Focus on these areas will significantly improve your foundational knowledge.",0.9,False,,,,
+2,5,5,2,Test_Assignment_2 – Short Answer (Docker &amp; Containers),"1. A Docker image is the same as a container, but image is the installed one and container 
+is another name for it. 
+ 
+2. Docker Compose is mainly used to make Docker faster and improve internet connection 
+between containers. 
+ 
+3. Containerization is useful because it makes code run more quickly than normal 
+programs.",0,"⚠️ Plagiarism warning: Similarity flagged.
+
+Your performance on 'Test_Assignment_2 – Short Answer (Docker &amp; Containers)' indicates a critical need to revisit foundational concepts. Across all questions, your answers demonstrate a consistent misunderstanding, particularly regarding the distinction between Docker images and containers in Q1, the actual purpose and benefits of Docker Compose in Q2, and the practical advantages of containerization in Q3. This pattern is concerning, especially as your recent grades show a recurring 0% understanding in similar Docker-related assignments. It's clear that you're struggling with the core definitions and use cases. To improve, focus on grasping these basic principles and their real-world applications. Hands-on practice will be essential to bridge these conceptual gaps and build a solid understanding.",1.0,True,,,,
+3,6,6,2,Test_Assignment_2 – Short Answer (Docker &amp; Containers),"1. A Docker image is used to create a container. The image contains the software and 
+setup, and the container is the running version of it. The image does not run by itself, but 
+the container does. 
+ 
+2. Docker Compose is used when we have many containers and want to run them together. 
+It is helpful for development because it saves time and makes commands simpler. 
+ 
+3. It is useful when building a project with a backend and database, because both can run 
+inside containers instead of installing everything directly on the computer.",67,"⚠️ Plagiarism warning: Similarity flagged.
+
+On your 'Test_Assignment_2 – Short Answer (Docker & Containers)', you demonstrated a foundational understanding of Docker's purpose and its practical benefits, particularly evident in your strong answer for Q3. You provided a clear and practical example of containerization for a backend and database, correctly identifying the benefit of avoiding direct installations. 
+
+However, your answers for Q1 and Q2 indicated areas for improvement regarding detail and precise terminology. While you recognized that a Docker image is used to create a container (Q1), you missed defining an image as a read-only template or a container as an isolated environment. Similarly, for Docker Compose (Q2), you correctly identified its role in orchestrating multiple containers but overlooked its crucial function in ensuring consistent development environments.
+
+To enhance your understanding and scores, focus on mastering precise Docker terminology. Elaborate on the 'why' and 'how' of Docker features, explaining *how* Docker Compose simplifies workflows and *why* environmental consistency is paramount. Developing more comprehensive answers that include detailed characteristics will greatly strengthen your grasp of these core concepts.",0.85,True,,,,

@@ -1,4 +1,4 @@
-import os, json
+import os, json, time
 from typing import Dict, Any
 from google import genai
 
@@ -12,11 +12,21 @@ class GeminiLLM:
 
     def generate_json(self, system: str, user: str) -> Dict[str, Any]:
         prompt = f"{system}\n\n{user}\n\nReturn ONLY valid JSON. No markdown."
-        resp = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            # Ask for JSON output
-            config={"response_mime_type": "application/json"},
-        )
-        text = (resp.text or "").strip()
-        return json.loads(text)
+
+        last_err = None
+        for attempt in range(4):
+            try:
+                resp = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config={"response_mime_type": "application/json"},
+                )
+                text = (resp.text or "").strip()
+                return json.loads(text)
+            except Exception as e:
+                last_err = e
+                wait_s = 5 * (attempt + 1)
+                print(f"⚠️ Gemini call failed (attempt {attempt + 1}/4): {e}")
+                time.sleep(wait_s)
+
+        raise RuntimeError(str(last_err))

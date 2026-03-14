@@ -105,7 +105,7 @@ def _concepts_from_question_text(question: str, qno: int) -> List[str]:
     return manual[:4]
 
 
-def _fallback_rubric(question_defs: List[dict], qmap: Dict[int, str]) -> List[dict]:
+def _fallback_rubric(question_defs: List[dict], qmap: Dict[int, str], default_max_score: int = 3) -> List[dict]:
     out = []
     seen = set()
 
@@ -117,7 +117,7 @@ def _fallback_rubric(question_defs: List[dict], qmap: Dict[int, str]) -> List[di
         out.append({
             "qno": qno,
             "question": question,
-            "max_score": 3,
+            "max_score": default_max_score,
             "criteria": [
                 "Correct core idea",
                 "Relevant technical detail",
@@ -132,7 +132,7 @@ def _fallback_rubric(question_defs: List[dict], qmap: Dict[int, str]) -> List[di
             out.append({
                 "qno": qno,
                 "question": f"Question {qno}",
-                "max_score": 3,
+                "max_score": default_max_score,
                 "criteria": [
                     "Correct core idea",
                     "Relevant technical detail",
@@ -243,7 +243,7 @@ def _derive_concept_scores(per_question: dict) -> dict:
     return {k: round(sum(v) / len(v), 2) for k, v in bucket.items() if v}
 
 
-def _compute_grade(per_question: dict) -> int:
+def _compute_grade(per_question: dict, dataset_name: str = "") -> int:
     total = 0
     total_max = 0
     for _, item in per_question.items():
@@ -252,7 +252,17 @@ def _compute_grade(per_question: dict) -> int:
 
     if total_max <= 0:
         return 0
-    return int(round((total / total_max) * 100))
+
+    ratio = total / total_max
+
+    if dataset_name.upper() == "ASAG":
+        if ratio <= 0.25:
+            return 0
+        if ratio < 0.75:
+            return 50
+        return 100
+
+    return int(round(ratio * 100))
 
 
 def _filter_personalization_to_assignment(student_context: Dict[str, Any], rubric_questions: List[dict]) -> Dict[str, Any]:
@@ -319,82 +329,7 @@ def _fallback_reason(score: int, max_score: int, question: str) -> str:
     return f"Partially correct answer for: {question}"
 
 
-def _looks_wrong_for_docker_q1(answer: str) -> bool:
-    a = answer.lower()
-    bad_markers = [
-        "same as a container",
-        "same as container",
-        "another name for it",
-        "installed one",
-    ]
-    return any(x in a for x in bad_markers)
 
-
-def _looks_wrong_for_docker_q2(answer: str) -> bool:
-    a = answer.lower()
-    bad_markers = [
-        "make docker faster",
-        "improve internet connection",
-        "faster internet",
-        "internet connection between containers",
-    ]
-    return any(x in a for x in bad_markers)
-
-
-def _looks_weak_for_docker_q3(answer: str) -> bool:
-    a = answer.lower()
-    bad_markers = [
-        "run more quickly than normal programs",
-        "makes code run more quickly",
-    ]
-    return any(x in a for x in bad_markers)
-
-
-def _heuristic_score_answer(question: str, answer: str, max_score: int) -> int:
-    ql = question.lower()
-    al = answer.lower()
-
-    if "docker image" in ql and "container" in ql:
-        if _looks_wrong_for_docker_q1(answer):
-            return 0
-        if ("read-only" in al or "template" in al or "contains" in al) and ("running instance" in al or "running version" in al):
-            return max_score
-        if "used to create a container" in al and "running version" in al:
-            return max_score - 1
-        return 0
-
-    if "docker compose" in ql:
-        if _looks_wrong_for_docker_q2(answer):
-            return 0
-        if ("run them together" in al or "multiple containers" in al or "multi-container" in al) and ("development" in al or "simpler" in al or "saves time" in al or "one command" in al):
-            return max_score - 1
-        if "multiple containers" in al or "run together" in al:
-            return 1
-        return 0
-
-    if "containerization" in ql or "practical example" in ql:
-        if _looks_weak_for_docker_q3(answer):
-            return 0
-        if ("backend" in al and "database" in al) or ("same environment" in al) or ("deploy" in al) or ("developer" in al and "machine" in al):
-            return max_score - 1
-        if "container" in al or "environment" in al:
-            return 1
-        return 0
-
-    q_words = set(_tokenize_words(question))
-    a_words = set(_tokenize_words(answer))
-    overlap = len(q_words.intersection(a_words))
-    answer_len = len(a_words)
-
-    if answer_len == 0:
-        return 0
-    if overlap >= 4 and answer_len >= 12:
-        return max_score
-    if overlap >= 2 and answer_len >= 8:
-        return max(1, max_score - 1)
-    if answer_len >= 8:
-        return 1
-    return 0
 
 
 def _fallback_evaluate_answers(rubric_questions: List[dict], qmap: Dict[int, str]) -> dict:
@@ -478,18 +413,25 @@ def _looks_suspicious(evaluation: dict, answers_payload: List[dict]) -> bool:
     for ans in answers_payload:
         key = f"Q{ans['qno']}"
         item = perq.get(key, {})
-        answer = (ans.get("answer") or "").lower()
+        answer = (ans.get("answer") or "").strip()
         score = int(item.get("score", 0))
-        max_score = int(item.get("max_score", 3))
+        max_score = max(1, int(item.get("max_score", 1)))
+        reason = (item.get("reason") or "").strip().lower()
 
-        if _looks_wrong_for_docker_q1(answer) and score >= 2:
+        # suspicious if answer is empty but got marks
+        if not answer and score > 0:
             return True
-        if _looks_wrong_for_docker_q2(answer) and score >= 2:
+
+        # suspicious if full marks but no reason
+        if score == max_score and not reason:
             return True
-        if _looks_weak_for_docker_q3(answer) and score >= 2:
+
+        # suspicious if zero marks but reason says partly correct / correct
+        if score == 0 and any(x in reason for x in ["partly correct", "partially correct", "some correct", "mostly correct", "correct"]):
             return True
 
     return False
+
 
 
 def _feedback_looks_generic(text: str, assignment_title: str, assignment_prompt: str = "") -> bool:
@@ -504,7 +446,6 @@ def _feedback_looks_generic(text: str, assignment_title: str, assignment_prompt:
 
     bad_patterns = ["good work overall"]
 
-    # Only treat k8s-only terms as suspicious when the assignment is NOT k8s
     if not is_k8s:
         bad_patterns.extend([
             "label-selector",
@@ -569,12 +510,17 @@ def run_multi_agent(
     assignment_context = assignment_context or {}
     assignment_title = (assignment_context.get("assignment_title") or "Assignment").strip()
     assignment_prompt = _strip_html(assignment_context.get("assignment_prompt") or "")
+    reference_answer = _strip_html(assignment_context.get("reference_answer") or "")
+    dataset_name = (assignment_context.get("dataset_name") or "").strip()
+    dataset_max_score = _safe_int(assignment_context.get("dataset_max_score"), 3)
+    if dataset_max_score <= 0:
+        dataset_max_score = 3
 
     question_defs = _extract_questions_from_prompt(assignment_prompt)
     if not question_defs:
         question_defs = [{"qno": qno, "question": f"Question {qno}"} for qno in sorted(qmap.keys())]
 
-    fallback_rubric = _fallback_rubric(question_defs, qmap)
+    fallback_rubric = _fallback_rubric(question_defs, qmap, default_max_score=dataset_max_score)
 
     answers_payload = []
     for q in fallback_rubric:
@@ -594,13 +540,17 @@ Assignment title:
 Assignment prompt:
 {assignment_prompt}
 
+Reference answer:
+{reference_answer}
+
 Detected questions:
 {json.dumps(question_defs, ensure_ascii=False)}
 
 Create a grading rubric for each question.
 
 Rules:
-- If no explicit marks are given, use max_score = 3 for each question.
+- If dataset_max_score is provided, use that as max_score for each question unless the assignment explicitly gives another score.
+- dataset_max_score for this run is {dataset_max_score}.
 - For each question, write 3 to 5 concrete expected points.
 - Criteria must be specific to the actual question, not generic.
 - Concepts must be assignment-topic concepts only.
@@ -614,7 +564,7 @@ Return STRICT JSON:
     {{
       "qno": 1,
       "question": "text",
-      "max_score": 3,
+      "max_score": {dataset_max_score},
       "criteria": [
         "specific expected point 1",
         "specific expected point 2",
@@ -633,12 +583,18 @@ Return STRICT JSON:
     personalization_context = _build_personalization_context(student_context)
 
     eval_json = llm.generate_json(
-        system="You are a strict academic grader. Return STRICT JSON only.",
+        system="You are a strict but fair academic short-answer grader. Grade for meaning, not wording. Return STRICT JSON only.",
         user=f"""
-Grade the student's answers using the rubric.
+Grade the student's answers using the rubric and reference answer.
 
 Assignment title:
 {assignment_title}
+
+Assignment prompt:
+{assignment_prompt}
+
+Reference answer:
+{reference_answer}
 
 Rubric:
 {json.dumps(rubric_questions, ensure_ascii=False)}
@@ -651,7 +607,7 @@ Return STRICT JSON:
   "per_question": {{
     "Q1": {{
       "score": 0,
-      "max_score": 3,
+      "max_score": {dataset_max_score},
       "reason": "one or two sentences",
       "strengths": ["..."],
       "gaps": ["..."],
@@ -669,25 +625,29 @@ Return STRICT JSON:
 
 Rules:
 - score must be between 0 and max_score
-- do not award marks for vague or incorrect statements
-- if a definition is reversed or conceptually wrong, score 0
-- if an example is generic but still valid, partial credit is okay
-- be strict but fair
-- do not use markdown
+- compare the student's meaning against the reference answer and rubric
+- accept paraphrases, brief answers, and minor grammar mistakes when the meaning is correct
+- for ASAG-style short answers, do not require exact wording
+- award full credit when the core idea is correct and sufficient
+- award partial credit when the answer is partly correct but incomplete
+- give zero only when the answer is wrong, reversed, off-topic, or missing the main idea
+- reason must mention why marks were awarded or lost
 - feedback must match actual answer quality
+- do not use markdown
 """
     )
-
+    print("DEBUG rubric_json:", json.dumps(rubric_json, indent=2, ensure_ascii=False))
+    print("DEBUG eval_json:", json.dumps(eval_json, indent=2, ensure_ascii=False))
     evaluation = _normalize_eval(eval_json, rubric_questions)
 
-    # Only use heuristic fallback if the LLM output is missing/broken/suspicious.
     if _needs_eval_fallback(evaluation) or _looks_suspicious(evaluation, answers_payload):
         print("⚠️ Falling back to heuristic evaluation")
         evaluation = _fallback_evaluate_answers(rubric_questions, qmap)
 
     if not evaluation["concept_scores"]:
         evaluation["concept_scores"] = _derive_concept_scores(evaluation["per_question"])
-    grade = _compute_grade(evaluation["per_question"])
+
+    grade = _compute_grade(evaluation["per_question"], dataset_name=dataset_name)
 
     feedback_json = llm.generate_json(
         system="You are the Personalized Feedback Agent. Return STRICT JSON only.",
@@ -729,20 +689,6 @@ Rules:
     weaknesses = [str(x).strip() for x in (feedback_json.get("weaknesses") or []) if str(x).strip()][:3]
     next_steps = [str(x).strip() for x in (feedback_json.get("next_steps") or []) if str(x).strip()][:3]
 
-    print("DEBUG generic_feedback_flag:", _feedback_looks_generic(final_feedback, assignment_title, assignment_prompt))
-    # Temporarily disabled for debugging
-    # if _feedback_looks_generic(final_feedback, assignment_title, assignment_prompt):
-    #     fb = _build_fallback_feedback(
-    #         assignment_title=assignment_title,
-    #         evaluation=evaluation,
-    #         personalization_context=personalization_context,
-    #         grade=grade,
-    #     )
-    #     final_feedback = fb["final_feedback"]
-    #     strengths = fb["strengths"]
-    #     weaknesses = fb["weaknesses"]
-    #     next_steps = fb["next_steps"]
-
     qa_json = llm.generate_json(
         system="You are the Feedback QA Agent. Return STRICT JSON only.",
         user=f"""
@@ -750,6 +696,9 @@ Check whether the score, reasons, and final feedback are consistent.
 
 Assignment title:
 {assignment_title}
+
+Reference answer:
+{reference_answer}
 
 Evaluation:
 {json.dumps(evaluation, ensure_ascii=False)}
@@ -768,8 +717,30 @@ Return STRICT JSON:
   "quality_score": 0.0,
   "issues": []
 }}
+
+Rules:
+- Lower the quality score if score and explanation do not match
+- Lower the quality score if the feedback is generic
+- Lower the quality score if a likely partially-correct answer was scored as zero
+- Lower the quality score if the feedback invents issues not present in evaluation
 """
     )
+
+    qa_score = _safe_float(qa_json.get("quality_score", 0.0), 0.0)
+    if (
+        _feedback_looks_generic(final_feedback, assignment_title, assignment_prompt)
+        or qa_score < 0.75
+    ):
+        fb = _build_fallback_feedback(
+            assignment_title=assignment_title,
+            evaluation=evaluation,
+            personalization_context=personalization_context,
+            grade=grade,
+        )
+        final_feedback = fb["final_feedback"]
+        strengths = fb["strengths"]
+        weaknesses = fb["weaknesses"]
+        next_steps = fb["next_steps"]
 
     result = {
         "grade": grade,
@@ -799,4 +770,7 @@ Return STRICT JSON:
 
     print("DEBUG grade:", grade)
     print("DEBUG result:", result)
+    print("DEBUG final grade:", grade)
+    print("DEBUG final feedback:", final_feedback)
+
     return result

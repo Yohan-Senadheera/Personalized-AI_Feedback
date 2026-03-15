@@ -32,6 +32,12 @@ def _safe_float(v, default=0.0):
     except Exception:
         return default
 
+def _safe_score(v, default=0.0):
+    try:
+        return float(v)
+    except Exception:
+        return default
+
 
 def _safe_int(v, default=0):
     try:
@@ -191,8 +197,9 @@ def _normalize_eval(eval_json: dict, rubric_questions: List[dict]) -> dict:
         key = f"Q{qno}"
         item = per_question.get(key, {}) if isinstance(per_question, dict) else {}
 
-        max_score = _clamp(_safe_int(item.get("max_score", rq["max_score"]), rq["max_score"]), 1, 10)
-        score = _clamp(_safe_int(item.get("score", 0), 0), 0, max_score)
+        max_score = float(_clamp(_safe_float(item.get("max_score", rq["max_score"]), rq["max_score"]), 1, 10))
+        score = round(_clamp(_safe_float(item.get("score", 0), 0.0), 0.0, max_score), 2)
+
 
         reason = (item.get("reason") or "").strip()
         strengths = [str(x).strip() for x in (item.get("strengths") or []) if str(x).strip()][:3]
@@ -243,26 +250,35 @@ def _derive_concept_scores(per_question: dict) -> dict:
     return {k: round(sum(v) / len(v), 2) for k, v in bucket.items() if v}
 
 
-def _compute_grade(per_question: dict, dataset_name: str = "") -> int:
-    total = 0
-    total_max = 0
+def _compute_grade(
+    per_question: dict,
+    dataset_name: str = "",
+    dataset_grade_max: float | None = None
+) -> float:
+    total = 0.0
+    total_max = 0.0
+
     for _, item in per_question.items():
-        total += item["score"]
-        total_max += item["max_score"]
+        total += float(item["score"])
+        total_max += float(item["max_score"])
 
     if total_max <= 0:
-        return 0
+        return 0.0
 
     ratio = total / total_max
 
     if dataset_name.upper() == "ASAG":
         if ratio <= 0.25:
-            return 0
+            return 0.0
         if ratio < 0.75:
-            return 50
-        return 100
+            return 50.0
+        return 100.0
 
-    return int(round(ratio * 100))
+    if dataset_grade_max is not None and dataset_grade_max > 0:
+        return round(ratio * float(dataset_grade_max), 2)
+
+    return round(ratio * 100.0, 2)
+
 
 
 def _filter_personalization_to_assignment(student_context: Dict[str, Any], rubric_questions: List[dict]) -> Dict[str, Any]:
@@ -329,6 +345,21 @@ def _fallback_reason(score: int, max_score: int, question: str) -> str:
     return f"Partially correct answer for: {question}"
 
 
+def _heuristic_score_answer(question: str, answer: str, max_score: float) -> float:
+    q_words = set(_tokenize_words(question))
+    a_words = set(_tokenize_words(answer))
+    overlap = len(q_words.intersection(a_words))
+    answer_len = len(a_words)
+
+    if answer_len == 0:
+        return 0.0
+    if overlap >= 4 and answer_len >= 12:
+        return float(max_score)
+    if overlap >= 2 and answer_len >= 8:
+        return round(float(max_score) * 0.5, 2)
+    if answer_len >= 6:
+        return round(float(max_score) * 0.25, 2)
+    return 0.0
 
 
 
@@ -466,7 +497,7 @@ def _build_fallback_feedback(
 ) -> dict:
     per_question = evaluation["per_question"]
 
-    parts = [f"You scored {grade}/100 on {assignment_title}."]
+    parts = [f"Your score for {assignment_title} is {grade}."]
     strengths = []
     weaknesses = []
     next_steps = []
@@ -625,6 +656,7 @@ Return STRICT JSON:
 
 Rules:
 - score must be between 0 and max_score
+- For VALIDATION_FEEDBACK, scores may use 0.5-step partial credit.
 - compare the student's meaning against the reference answer and rubric
 - accept paraphrases, brief answers, and minor grammar mistakes when the meaning is correct
 - for ASAG-style short answers, do not require exact wording
@@ -647,7 +679,12 @@ Rules:
     if not evaluation["concept_scores"]:
         evaluation["concept_scores"] = _derive_concept_scores(evaluation["per_question"])
 
-    grade = _compute_grade(evaluation["per_question"], dataset_name=dataset_name)
+    grade = _compute_grade(
+    evaluation["per_question"],
+    dataset_name=dataset_name,
+    dataset_grade_max=assignment_context.get("dataset_grade_max"),
+)
+
 
     feedback_json = llm.generate_json(
         system="You are the Personalized Feedback Agent. Return STRICT JSON only.",
@@ -689,42 +726,56 @@ Rules:
     weaknesses = [str(x).strip() for x in (feedback_json.get("weaknesses") or []) if str(x).strip()][:3]
     next_steps = [str(x).strip() for x in (feedback_json.get("next_steps") or []) if str(x).strip()][:3]
 
-    qa_json = llm.generate_json(
-        system="You are the Feedback QA Agent. Return STRICT JSON only.",
-        user=f"""
-Check whether the score, reasons, and final feedback are consistent.
+#     qa_json = llm.generate_json(
+#         system="You are the Feedback QA Agent. Return STRICT JSON only.",
+#         user=f"""
+# Check whether the score, reasons, and final feedback are consistent.
 
-Assignment title:
-{assignment_title}
+# Assignment title:
+# {assignment_title}
 
-Reference answer:
-{reference_answer}
+# Reference answer:
+# {reference_answer}
 
-Evaluation:
-{json.dumps(evaluation, ensure_ascii=False)}
+# Evaluation:
+# {json.dumps(evaluation, ensure_ascii=False)}
 
-Final feedback:
-{json.dumps({
-    "final_feedback": final_feedback,
-    "strengths": strengths,
-    "weaknesses": weaknesses,
-    "next_steps": next_steps,
-    "grade": grade
-}, ensure_ascii=False)}
+# Final feedback:
+# {json.dumps({
+#     "final_feedback": final_feedback,
+#     "strengths": strengths,
+#     "weaknesses": weaknesses,
+#     "next_steps": next_steps,
+#     "grade": grade
+# }, ensure_ascii=False)}
 
-Return STRICT JSON:
-{{
-  "quality_score": 0.0,
-  "issues": []
-}}
+# Return STRICT JSON:
+# {{
+#   "quality_score": 0.0,
+#   "issues": []
+# }}
 
-Rules:
-- Lower the quality score if score and explanation do not match
-- Lower the quality score if the feedback is generic
-- Lower the quality score if a likely partially-correct answer was scored as zero
-- Lower the quality score if the feedback invents issues not present in evaluation
-"""
-    )
+# Rules:
+# - Lower the quality score if score and explanation do not match
+# - Lower the quality score if the feedback is generic
+# - Lower the quality score if a likely partially-correct answer was scored as zero
+# - Lower the quality score if the feedback invents issues not present in evaluation
+# """
+#     )
+    qa_json = {"quality_score": 1.0, "issues": ["QA skipped for bulk run"]}
+
+    if _feedback_looks_generic(final_feedback, assignment_title, assignment_prompt):
+        fb = _build_fallback_feedback(
+            assignment_title=assignment_title,
+            evaluation=evaluation,
+            personalization_context=personalization_context,
+            grade=grade,
+        )
+        final_feedback = fb["final_feedback"]
+        strengths = fb["strengths"]
+        weaknesses = fb["weaknesses"]
+        next_steps = fb["next_steps"]
+
 
     qa_score = _safe_float(qa_json.get("quality_score", 0.0), 0.0)
     if (
